@@ -1,77 +1,75 @@
+Python
 import streamlit as st
 import pandas as pd
 import hashlib
 import time
 import random
-import sqlite3
-import os
 
-# ==========================================
-# 0. 核心安全机制：数据库中央存储与并发锁
-# ==========================================
-DB_FILE = "iwrs_central_database.db"
+# =========================================================================
+# 0. 核心安全机制：云端 SQL 数据库中央存储（【替换】原先的 sqlite3 或内存 db 逻辑）
+# =========================================================================
+# 自动读取 Secrets 中的 connections.postgresql，全网 CRC 共享这一个中央账本
+conn = st.connection("postgresql", type="sql")
 
 def init_db():
-    """初始化中央数据库表结构"""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    # 项目主表
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS projects (
-            trial_id TEXT PRIMARY KEY,
-            trial_name TEXT,
-            pi TEXT,
-            unblind_pwd TEXT,
-            strata_list TEXT,
-            arms TEXT,
-            ratios TEXT,
-            seed_base INTEGER,
-            current_block_ids TEXT
-        )
-    ''')
-    # 盲底总库表
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS master_tables (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            trial_id TEXT,
-            stratum TEXT,
-            seq_id INTEGER,
-            block_id INTEGER,
-            block_size INTEGER,
-            true_arm TEXT,
-            blind_code TEXT
-        )
-    ''')
-    # 已分配受试者表（强锁唯一索引，防止多机器并发导致重复入组）
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS allocated_subjects (
-            trial_id TEXT,
-            subject_id TEXT,
-            stratum TEXT,
-            stratum_seq_id INTEGER,
-            true_arm TEXT,
-            blind_code TEXT,
-            operator TEXT,
-            time_stamp TEXT,
-            PRIMARY KEY (trial_id, subject_id)
-        )
-    ''')
-    # 审计日志表
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS audit_trail (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            time_stamp TEXT,
-            trial_id TEXT,
-            operator TEXT,
-            action TEXT,
-            details TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    """初始化云端数据库表结构（PostgreSQL 语法适配）"""
+    with conn.session as session:
+        # 1. 项目主表
+        session.execute("""
+            CREATE TABLE IF NOT EXISTS projects (
+                trial_id TEXT PRIMARY KEY,
+                trial_name TEXT,
+                pi TEXT,
+                unblind_pwd TEXT,
+                strata_list TEXT,
+                arms TEXT,
+                ratios TEXT,
+                seed_base INTEGER,
+                current_block_ids TEXT
+            );
+        """)
+        # 2. 盲底总库表
+        session.execute("""
+            CREATE TABLE IF NOT EXISTS master_tables (
+                id SERIAL PRIMARY KEY,
+                trial_id TEXT,
+                stratum TEXT,
+                seq_id INTEGER,
+                block_id INTEGER,
+                block_size INTEGER,
+                true_arm TEXT,
+                blind_code TEXT
+            );
+        """)
+        # 3. 已分配受试者表（联合主键强锁，杜绝多台机器录入同号受试者）
+        session.execute("""
+            CREATE TABLE IF NOT EXISTS allocated_subjects (
+                trial_id TEXT,
+                subject_id TEXT,
+                stratum TEXT,
+                stratum_seq_id INTEGER,
+                true_arm TEXT,
+                blind_code TEXT,
+                operator TEXT,
+                time_stamp TEXT,
+                PRIMARY KEY (trial_id, subject_id)
+            );
+        """)
+        # 4. 审计日志表
+        session.execute("""
+            CREATE TABLE IF NOT EXISTS audit_trail (
+                id SERIAL PRIMARY KEY,
+                time_stamp TEXT,
+                trial_id TEXT,
+                operator TEXT,
+                action TEXT,
+                details TEXT
+            );
+        """)
+        session.commit()
 
+# 强行触发初始化（如果云端表不存在则自动创建，存在则跳过）
 init_db()
-
 # ==========================================
 # 1. 极简 A/B 固定盲码随机化引擎
 # ==========================================
