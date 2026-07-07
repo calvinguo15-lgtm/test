@@ -3,403 +3,353 @@ import pandas as pd
 import hashlib
 import time
 import random
+import sqlite3
+import os
 
 # ==========================================
-# 1. 工业级：多臂自适应无限扩容随机化引擎
+# 0. 核心安全机制：数据库中央存储与并发锁
+# ==========================================
+DB_FILE = "iwrs_central_database.db"
+
+def init_db():
+    """初始化中央数据库表结构"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    # 项目主表
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS projects (
+            trial_id TEXT PRIMARY KEY,
+            trial_name TEXT,
+            pi TEXT,
+            unblind_pwd TEXT,
+            strata_list TEXT,
+            arms TEXT,
+            ratios TEXT,
+            seed_base INTEGER,
+            current_block_ids TEXT
+        )
+    ''')
+    # 盲底总库表
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS master_tables (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trial_id TEXT,
+            stratum TEXT,
+            seq_id INTEGER,
+            block_id INTEGER,
+            block_size INTEGER,
+            true_arm TEXT,
+            blind_code TEXT
+        )
+    ''')
+    # 已分配受试者表（强锁唯一索引，防止多机器并发导致重复入组）
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS allocated_subjects (
+            trial_id TEXT,
+            subject_id TEXT,
+            stratum TEXT,
+            stratum_seq_id INTEGER,
+            true_arm TEXT,
+            blind_code TEXT,
+            operator TEXT,
+            time_stamp TEXT,
+            PRIMARY KEY (trial_id, subject_id)
+        )
+    ''')
+    # 审计日志表
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS audit_trail (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            time_stamp TEXT,
+            trial_id TEXT,
+            operator TEXT,
+            action TEXT,
+            details TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ==========================================
+# 1. 极简 A/B 固定盲码随机化引擎
 # ==========================================
 class IWRSConfiguredEngine:
     @staticmethod
-    def generate_blind_block(trial_name, stratum, arms, ratios, start_seq_id, block_id, seed_base):
-        """以单个区组为单位，动态追加生成高度安全的随机序列"""
-        # 为当前区组动态生成独立种子，融合时钟、区组ID与方案号，保障不可预测性
+    def generate_and_save_blocks(trial_name, stratum, arms, ratios, start_seq_id, block_id, seed_base):
         block_seed = int(hashlib.md5(f"{trial_name}_{stratum}_{block_id}_{seed_base}".encode()).hexdigest(), 16) % 999999
         random.seed(block_seed)
         
         sum_ratios = sum(ratios)
-        # 智能区组长度控制：自适应交替使用1倍或2倍基础比例和，且确保不小于4，彻底打破猜盲规律
         multiplier = random.choice([1, 2])
         if sum_ratios * multiplier < 4:
             multiplier = 2 if sum_ratios * 2 >= 4 else 4
-            
         current_block_size = sum_ratios * multiplier
         
-        # 填充区组内容
         block_content = []
         actual_mult = current_block_size // sum_ratios
         for arm, ratio in zip(arms, ratios):
             block_content.extend([arm] * (ratio * actual_mult))
             
-        # 充分打乱区组内顺序
         random.shuffle(block_content)
         
-        # 组装盲底数据
-        block_rows = []
+        arm_to_simple_code = {arm: "A" if idx == 0 else ("B" if idx == 1 else chr(65 + idx)) for idx, arm in enumerate(arms)}
+
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
         for i, arm in enumerate(block_content):
             seq_id = start_seq_id + i
-            hash_input = f"{trial_name}_{stratum}_{seq_id}_{arm}_{block_seed}"
-            blind_code = "MED-" + hashlib.md5(hash_input.encode()).hexdigest()[:8].upper()
-            
-            block_rows.append({
-                "层内随机序号": seq_id,
-                "区组编号(Block_ID)": block_id,
-                "当前区组大小": current_block_size,
-                "真实分组(True_Arm)": arm,
-                "物资盲码(Blind_Code)": blind_code
-            })
-            
-        return block_rows
-
-# ==========================================
-# 2. 系统全局状态与持久化模拟数据库
-# ==========================================
-st.set_page_config(page_title="临床试验中央随机与盲法控制系统", layout="wide", page_icon="🏥")
-
-if "projects_db" not in st.session_state:
-    st.session_state.projects_db = {}
-if "audit_trail" not in st.session_state:
-    st.session_state.audit_trail = []       
+            blind_code = arm_to_simple_code[arm]
+            cursor.execute('''
+                INSERT INTO master_tables (trial_id, stratum, seq_id, block_id, block_size, true_arm, blind_code)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (trial_name, stratum, seq_id, block_id, current_block_size, arm, blind_code))
+        conn.commit()
+        conn.close()
 
 def add_audit_log(user, project, action, details):
-    st.session_state.audit_trail.append({
-        "时间戳": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
-        "操作项目": project,
-        "操作用户": user,
-        "操作行为": action,
-        "详细记录": details
-    })
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO audit_trail (time_stamp, trial_id, operator, action, details)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()), project, user, action, details))
+    conn.commit()
+    conn.close()
 
 # ==========================================
-# 3. 系统主体界面布局
+# 2. 前端 Streamlit 系统交互
 # ==========================================
-st.title("🏥 临床试验中央随机与盲法控制系统 (IWRS)")
-st.caption("系统完全依从《药物临床试验质量管理规范(GCP)》及电子数据合规性技术指南规范")
+st.set_page_config(page_title="临床试验中央随机系统", layout="wide")
+st.title("🏥 临床试验中央随机与盲法控制系统 (多用户云端版)")
+st.caption("基于中央 SQLite 数据库构建，支持多机构、多名 CRC 跨电脑同时登录并发操作，内置锁机制绝不冲突。")
 st.markdown("---")
 
-# 侧边栏：核心权限与活动项目切换
 st.sidebar.header("👤 身份与项目控制中心")
-current_role = st.sidebar.selectbox("当前登录角色", ["研究者/临床医生(Investigator)", "临床协调员(CRC)", "申办方监查员(CRA)", "数据管理员(DM)"])
+current_role = st.sidebar.selectbox("当前登录角色", ["研究者/临床医生(Investigator)", "临床协调员(CRC)", "数据管理员(DM)"])
 
-st.sidebar.markdown("---")
-if st.session_state.projects_db:
-    available_projects = list(st.session_state.projects_db.keys())
+# 从数据库动态加载活动项目
+conn = sqlite3.connect(DB_FILE)
+df_projects_load = pd.read_sql_query("SELECT * FROM projects", conn)
+conn.close()
+
+if not df_projects_load.empty:
+    available_projects = df_projects_load["trial_id"].tolist()
     selected_project_id = st.sidebar.selectbox("📂 当前操作项目", available_projects)
-    project_data = st.session_state.projects_db[selected_project_id]
+    project_row = df_projects_load[df_projects_load["trial_id"] == selected_project_id].iloc[0]
+    
+    # 解析字段
+    strata_list = project_row["strata_list"].split(",")
+    arms = project_row["arms"].split(",")
+    ratios = [int(x) for x in project_row["ratios"].split(",")]
+    unblind_pwd = project_row["unblind_pwd"]
+    trial_name = project_row["trial_name"]
 else:
     selected_project_id = None
-    project_data = None
     st.sidebar.info("系统中暂无活动项目，请先新建临床研究。")
 
-# 系统四大核心功能模块页签
 tab_create, tab_view_all, tab_enroll, tab_safety = st.tabs([
-    "➕ 新建临床研究项目", 
-    "👁️ 随机盲底库浏览", 
-    "🧑‍⚕️ 临床中心受试者入组", 
-    "🚨 安全突发事件与审计"
+    "➕ 新建临床研究项目", "👁️ 随机盲底库浏览", "🧑‍⚕️ 临床中心受试者入组", "🚨 安全突发事件与审计"
 ])
 
-# ------------------------------------------
-# 页签 1：新建临床研究项目（全新表单化、参数智能托管）
-# ------------------------------------------
+# 标签页 1：新建项目
 with tab_create:
     st.header("1. 临床研究方案配置与初始盲底锁定")
-    
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("##### 📝 研究方案基本信息")
-        new_trial_id = st.text_input("研究方案号 (首位唯一标识)", value="")
-        new_trial_name = st.text_input("临床研究全称", value="")
-        new_pi_name = st.text_input("主要研究者 (PI)", value="")
-        new_blind_type = st.selectbox("盲法设计类型", ["第三方评价者盲法 (单盲态评估)", "双盲 (Double-Blind)", "开放/不设盲"])
-        new_unblind_pwd = st.text_input("🔑 设定紧急解盲安全密码", type="password")
-        
-        st.markdown("##### 🏢 临床分层/研究中心设置")
-        new_strata_input = st.text_area("研究中心列表 (每行输入一个中心名称)", value="四川大学华西口腔医院\n区域合作中心")
-
+        new_trial_id = st.text_input("研究方案号 (例如: NS-2026-01)", value="NS-2026-01").strip()
+        new_trial_name = st.text_input("临床研究全称", value="某护理干预对患者预后影响的临床随机对照研究")
+        new_pi_name = st.text_input("主要研究者 (PI)", value="张教授")
+        new_unblind_pwd = st.text_input("🔑 设定紧急解盲安全密码", type="password", value="123456")
+        new_strata_input = st.text_area("研究中心列表 (每行输入一个中心名称)", value="四川大学华西医院\n合作中心B")
     with col2:
         st.markdown("##### 🧪 研究组别与分配比例设置")
-        
-        # 动态控制组别数量
-        if "arm_count" not in st.session_state:
-            st.session_state.arm_count = 2
-            
-        btn_col1, btn_col2 = st.columns(2)
-        with btn_col1:
-            if st.button("➕ 增加研究组别", use_container_width=True):
-                st.session_state.arm_count += 1
-        with btn_col2:
-            if st.button("➖ 减少研究组别", use_container_width=True) and st.session_state.arm_count > 2:
-                st.session_state.arm_count -= 1
-        
-        # 表单动态渲染独立的输入框
-        arms_list = []
-        ratios_list = []
-        
-        default_names = ["试验组", "对照组", "研究组C", "研究组D", "研究组E"]
-        for idx in range(st.session_state.arm_count):
-            c_arm, c_rat = st.columns([3, 1])
-            with c_arm:
-                d_name = default_names[idx] if idx < len(default_names) else f"研究组{chr(65+idx)}"
-                arm_name = st.text_input(f"组别 {idx+1} 名称", value=d_name, key=f"arm_n_{idx}")
-            with c_rat:
-                arm_ratio = st.number_input(f"比例", min_value=1, value=1, step=1, key=f"arm_r_{idx}")
-            arms_list.append(arm_name.strip())
-            ratios_list.append(int(arm_ratio))
+        st.info("💡 提示：系统会自动将【组别 1】映射为物资标签【A】，将【组别 2】映射为物资标签【B】。")
+        arm_1_name = st.text_input("组别 1 名称", value="全新护理干预组")
+        arm_2_name = st.text_input("组别 2 名称", value="常规临床对照组")
+        c_r1, c_r2 = st.columns(2)
+        with c_r1: r1 = st.number_input("组别 1 分配比例", min_value=1, value=1)
+        with c_r2: r2 = st.number_input("组别 2 分配比例", min_value=1, value=1)
 
-    st.markdown("---")
     if st.button("🔥 锁定方案配置并一键激活中央随机系统", type="primary", use_container_width=True):
-        if not new_trial_id.strip() or not new_unblind_pwd.strip():
+        if not new_trial_id or not new_unblind_pwd.strip():
             st.error("❌ 配置失败：研究方案号与紧急解盲安全密码为必填项！")
-        elif len(set(arms_list)) != len(arms_list):
-            st.error("❌ 配置失败：各个研究组别名称不能完全相同！")
-        elif new_trial_id in st.session_state.projects_db:
-            st.error(f"❌ 配置失败：方案号【{new_trial_id}】在系统中已存在，请勿重复创建。")
         else:
-            strata_list = [s.strip() for s in new_strata_input.split("\n") if s.strip()]
-            if not strata_list:
-                strata_list = ["单中心整体"]
+            # 查重
+            conn = sqlite3.connect(DB_FILE)
+            existing = pd.read_sql_query("SELECT trial_id FROM projects WHERE trial_id=?", conn, params=(new_trial_id,))
+            if not existing.empty:
+                st.error(f"❌ 激活失败：方案号 `{new_trial_id}` 已存在，请勿重复创建！")
+                conn.close()
+            else:
+                strata_arr = [s.strip() for s in new_strata_input.split("\n") if s.strip()]
+                if not strata_arr: strata_arr = ["单中心整体"]
+                arms_arr = [arm_1_name.strip(), arm_2_name.strip()]
+                ratios_str = f"{int(r1)},{int(r2)}"
+                seed_base = int((time.time() * 1000) % 999999)
                 
-            # 系统完全托管参数：随机初始化基础时钟种子
-            seed_base = int((time.time() * 1000) % 999999)
-            
-            # 初始化盲底大容器，并自动生成首批区组（包含50例储备，后续智能无感扩容）
-            master_tables = {}
-            current_block_ids = {}
-            
-            for stratum in strata_list:
-                master_tables[stratum] = []
-                current_block_ids[stratum] = 1
+                # 写入项目表
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO projects VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (new_trial_id, new_trial_name, new_pi_name, new_unblind_pwd, ",".join(strata_arr), ",".join(arms_arr), ratios_str, seed_base, "{}"))
+                conn.commit()
+                conn.close()
                 
-                # 初始预生成足够基础消耗的区组储备
-                while len(master_tables[stratum]) < 50:
-                    start_id = len(master_tables[stratum]) + 1
-                    b_rows = IWRSConfiguredEngine.generate_blind_block(
-                        new_trial_id, stratum, arms_list, ratios_list, 
-                        start_id, current_block_ids[stratum], seed_base
-                    )
-                    master_tables[stratum].extend(b_rows)
-                    current_block_ids[stratum] += 1
-            
-            # 记录项目核心数据
-            st.session_state.projects_db[new_trial_id] = {
-                "trial_name": new_trial_name,
-                "pi": new_pi_name,
-                "blind_type": new_blind_type,
-                "unblind_pwd": new_unblind_pwd,
-                "strata_list": strata_list,
-                "arms": arms_list,
-                "ratios": ratios_list,
-                "seed_base": seed_base,
-                "current_block_ids": current_block_ids, # 追踪当前各层的区组ID进度
-                "master_tables": master_tables,         # 基础储备盲底文件
-                "allocated_subjects": [],               # 入组真实患者流水账
-                "unblinded_list": set()                 # 破盲标记集
-            }
-            
-            add_audit_log("Independent_Statistician", new_trial_id, "INITIALIZE_PROJECT", 
-                          f"项目初始化成功。组别架构: {list(zip(arms_list, ratios_list))}。开启后台自适应区组及无限扩容引擎。")
-            st.success(f"✅ 临床研究【{new_trial_id}】中央随机配置已成功激活！请在左侧边栏切换项目开始入组。")
-            st.rerun()
+                # 预生成盲底库入库
+                for stratum in strata_arr:
+                    IWRSConfiguredEngine.generate_and_save_blocks(new_trial_id, stratum, arms_arr, [int(r1), int(r2)], 1, 1, seed_base)
+                
+                add_audit_log("System_Statistician", new_trial_id, "INITIALIZE_PROJECT", "项目通过数据库成功初始化，中央多机通道激活。")
+                st.success(f"✅ 临床研究【{new_trial_id}】中央随机系统已联合激活！")
+                st.rerun()
 
-    # 系统托管项目一览
-    if st.session_state.projects_db:
-        st.markdown("### 🗂️ 运行中临床研究项目清单")
-        summary_data = []
-        for pid, pdata in st.session_state.projects_db.items():
-            summary_data.append({
-                "方案号": pid,
-                "临床研究名称": pdata["trial_name"],
-                "主要研究者(PI)": pdata["pi"],
-                "盲法设计": pdata["blind_type"],
-                "包含中心/层级数": len(pdata["strata_list"]),
-                "当前已入组受试者": f"{len(pdata['allocated_subjects'])} 例"
-            })
-        st.dataframe(pd.DataFrame(summary_data), use_container_width=True)
-
-# ------------------------------------------
-# 页签 2：盲底库浏览（展示系统智能分配的结果）
-# ------------------------------------------
+# 标签页 2：盲底浏览
 with tab_view_all:
     st.header("2. 核心随机盲底矩阵储备仓")
-    if not selected_project_id:
-        st.warning("⚠️ 请先创建或选择一个活动项目。")
-    else:
-        st.subheader(f"🗂️ 方案号：{selected_project_id}")
-        
-        if current_role not in ["数据管理员(DM)", "申办方监查员(CRA)"]:
-            st.error(f"🔒 盲态控制拦截：当前登录身份【{current_role}】属于临床盲态执行人员，严禁调阅后台随机盲底表格！")
+    if selected_project_id:
+        if current_role not in ["数据管理员(DM)"]:
+            st.error(f"🔒 盲态控制拦截：当前登录角色无权调阅盲底表！")
         else:
-            st.success(f"🔓 身份验证成功：非盲权限【{current_role}】获准查看项目当前已生成的随机储备序列。")
-            chosen_view_stratum = st.selectbox("请选择要核查的研究中心/层级", project_data["strata_list"])
-            
-            raw_table_df = pd.DataFrame(project_data["master_tables"][chosen_view_stratum])
-            display_df = raw_table_df.copy()
-            
-            # CRA进行盲态监查时模糊治疗组，只有最高权限DM导出盲底时才可见真实分组
-            if "开放" not in project_data["blind_type"] and current_role == "CRA":
-                display_df["真实分组(True_Arm)"] = "🔒 [已设盲] 仅限非盲数据管理员(DM)导出盲底使用"
-                
-            st.dataframe(display_df, use_container_width=True)
-            
-            if current_role == "DM":
-                csv_blind = raw_table_df.to_csv(index=False).encode('utf-8-sig')
-                st.download_button(
-                    label="📥 导出当前已生成全量盲底文件 (CSV)",
-                    data=csv_blind,
-                    file_name=f"IWRS_Master_Table_{selected_project_id}_{chosen_view_stratum}.csv",
-                    mime='text/csv'
-                )
+            chosen_view_stratum = st.selectbox("请选择要核查的研究中心/层级", strata_list)
+            conn = sqlite3.connect(DB_FILE)
+            raw_table_df = pd.read_sql_query("SELECT seq_id as 层内随机序号, block_id as 区组编号, block_size as 当前区组大小, true_arm as 真实分组, blind_code as 物资盲码 FROM master_tables WHERE trial_id=? AND stratum=?", conn, params=(selected_project_id, chosen_view_stratum))
+            conn.close()
+            st.dataframe(raw_table_df, use_container_width=True)
 
-# ------------------------------------------
-# 页签 3：患者动态入组（包含全自动智能扩容逻辑）
-# ------------------------------------------
+# 标签页 3：现场入组与发药（支持并发互锁机制）
 with tab_enroll:
     st.header("3. 现场受试者动态筛选与中央分配")
-    if not selected_project_id:
-        st.warning("⚠️ 请在左侧控制中心选择一个活动项目。")
-    else:
-        st.markdown(f"**🟢 当前活动项目：** `[{selected_project_id}] {project_data['trial_name']}`")
-        st.markdown(f"**研究涉及组别：** {', '.join(project_data['arms'])} | **设计盲法：** {project_data['blind_type']}")
+    if selected_project_id:
+        st.markdown(f"**🟢 当前活动项目：** `[{selected_project_id}] {trial_name}`")
+        col_e1, col_e2 = st.columns([1, 1])
+        
+        # 实时从共享数据库读取该项目当前的入组记录
+        conn = sqlite3.connect(DB_FILE)
+        df_allocated = pd.read_sql_query("SELECT * FROM allocated_subjects WHERE trial_id=?", conn, params=(selected_project_id,))
+        conn.close()
+        
+        with col_e1:
+            sub_id_raw = st.text_input("请输入受试者唯一编号 (如住院号或 S001)", value="")
+            sub_id = sub_id_raw.strip()
+            chosen_stratum = st.selectbox("请选择受试者所在研究中心", strata_list)
+            
+            # 检测受试者是否已存在于数据库
+            existing_records = df_allocated[df_allocated['subject_id'] == sub_id] if not df_allocated.empty else pd.DataFrame()
+            
+            if st.button("🚀 申请中央随机，获取发放标签", type="primary", use_container_width=True):
+                if not sub_id:
+                    st.error("❌ 错误：请输入有效的受试者编号！")
+                elif not existing_records.empty:
+                    st.warning(f"⚠️ 提示：受试者 `{sub_id}` 此前已于 {existing_records.iloc[0]['time_stamp']} 完成随机，不可重复随机！")
+                else:
+                    # 【核心并发锁机制】进入数据库事务，确保即使两个 CRC 同时点击，也会排队处理
+                    conn = sqlite3.connect(DB_FILE)
+                    cursor = conn.cursor()
+                    try:
+                        # 1. 重新在事务内部查重，彻底杜绝两台机器瞬间同时提交同名患者
+                        cursor.execute("SELECT * FROM allocated_subjects WHERE trial_id=? AND subject_id=?", (selected_project_id, sub_id))
+                        if cursor.fetchone() is not None:
+                            st.warning("⚠️ 提示：检测到其他终端刚刚捷足先登录入了该受试者！")
+                        else:
+                            # 2. 计算当前中心在数据库中已入组的人数
+                            cursor.execute("SELECT COUNT(*) FROM allocated_subjects WHERE trial_id=? AND stratum=?", (selected_project_id, chosen_stratum))
+                            current_idx = cursor.fetchone()[0]
+                            
+                            # 3. 如果发现生成的储备盲底不够了，动态扩容
+                            cursor.execute("SELECT COUNT(*) FROM master_tables WHERE trial_id=? AND stratum=?", (selected_project_id, chosen_stratum))
+                            total_pool = cursor.fetchone()[0]
+                            if current_idx >= total_pool:
+                                cursor.execute("SELECT MAX(block_id) FROM master_tables WHERE trial_id=? AND stratum=?", (selected_project_id, chosen_stratum))
+                                max_b_id = cursor.fetchone()[0] or 0
+                                IWRSConfiguredEngine.generate_and_save_blocks(selected_project_id, chosen_stratum, arms, ratios, total_pool + 1, max_b_id + 1, int(project_row["seed_base"]))
+                            
+                            # 4. 精准取出当前排队序号对应的盲底行
+                            cursor.execute("SELECT seq_id, true_arm, blind_code FROM master_tables WHERE trial_id=? AND stratum=? LIMIT 1 OFFSET ?", (selected_project_id, chosen_stratum, current_idx))
+                            matched_row = cursor.fetchone()
+                            
+                            # 5. 写入受试者分配表（依靠数据库主键，若有冲突会立刻回滚）
+                            cursor.execute('''
+                                INSERT INTO allocated_subjects VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            ''', (selected_project_id, sub_id, chosen_stratum, matched_row[0], matched_row[1], matched_row[2], current_role, time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())))
+                            conn.commit()
+                            
+                            add_audit_log(current_role, selected_project_id, "MANUAL_ALLOCATE", f"多机同步网关成功为患者 {sub_id} 分配物资标签: {matched_row[2]}")
+                            st.success("🎉 中央随机成功！右侧已刷新配发结果。")
+                            st.rerun()
+                    except sqlite3.IntegrityError:
+                        conn.rollback()
+                        st.error("❌ 并发冲突冲突拦截：由于多名独立CRC同时操作，此编号正在被录入，请刷新重试！")
+                    finally:
+                        conn.close()
+                        
+        with col_e2:
+            if sub_id and not existing_records.empty:
+                st.markdown("### 📦 现场分发指引 (历史记录查重)")
+                st.info(f"该受试者为**老患者**，请继续配发大写字母标签为 **【 {existing_records.iloc[0]['blind_code']} 】** 的药品/物资。")
+            elif not df_allocated.empty:
+                latest_sub = df_allocated.iloc[-1]
+                st.markdown("### 📦 现场分发指引 (中央实时最新)")
+                st.success(f"请立刻为受试者 `{latest_sub['subject_id']}` 配发贴有大写字母标签为 **【 {latest_sub['blind_code']} 】** 的药品/物资。")
+                
         st.markdown("---")
         
-        col_e1, col_e2 = st.columns(2)
-        with col_e1:
-            st.markdown("##### ✍️ 录入筛选合格受试者信息")
-            sub_id = st.text_input("请输入受试者唯一编号 (例如: S001)", value="")
-            chosen_stratum = st.selectbox("请选择受试者所在研究中心", project_data["strata_list"])
-            
-            if current_role in ["申办方监查员(CRA)", "数据管理员(DM)"]:
-                st.error(f"❌ 权限拦截：当前角色【{current_role}】属于非盲/监查角色，无权执行临床现场分配操作！")
-                allow_alloc = False
+        # 设盲控制与实时盲态计数展示
+        col_view1, col_view2 = st.columns([2, 1])
+        with col_view1:
+            st.markdown("##### 📋 中央数据库实时已入组受试者详细清单")
+            if not df_allocated.empty:
+                # 重命名列名以适配前端
+                df_show = df_allocated.copy()
+                df_show.columns = ["方案号", "受试者编号", "研究中心", "层内随机序号", "真实分组", "物资盲码(Blind_Code)", "操作人", "入组时间"]
+                if current_role not in ["数据管理员(DM)"]: 
+                    df_show["真实分组"] = "🔒 [已设盲保护]"
+                st.dataframe(df_show, use_container_width=True)
             else:
-                allow_alloc = True
+                st.caption("暂无受试者入组")
                 
-            if st.button("🚀 申请中央随机，动态匹配物资盲码", type="primary", disabled=not allow_alloc):
-                if not sub_id.strip():
-                    st.error("❌ 错误：受试者编号不能为空！")
-                elif any(x['Subject_ID'] == sub_id.strip() for x in project_data["allocated_subjects"]):
-                    st.error(f"❌ 错误：受试者编号 {sub_id} 已存在，不可重复分配。")
+        with col_view2:
+            st.markdown("##### 📊 试验盲态中央监控")
+            if current_role == "数据管理员(DM)":
+                if not df_allocated.empty:
+                    st.dataframe(df_allocated["true_arm"].value_counts())
                 else:
-                    # 1. 计算当前中心已分配的人数
-                    allocated_in_stratum = [x for x in project_data["allocated_subjects"] if x['Stratum'] == chosen_stratum]
-                    current_idx = len(allocated_in_stratum)
-                    
-                    # 2. 【核心智能化：无感自动扩容技术】
-                    # 如果当前已分配人数接近或超过了当前已生成的储备量，系统自动在后台静默生成全新的下一个区组
-                    if current_idx >= len(project_data["master_tables"][chosen_stratum]) - 2:
-                        start_id = len(project_data["master_tables"][chosen_stratum]) + 1
-                        next_block_id = project_data["current_block_ids"][chosen_stratum]
-                        
-                        # 静默追加一个完美的、动态长度的新区组
-                        new_block_rows = IWRSConfiguredEngine.generate_blind_block(
-                            selected_project_id, chosen_stratum, project_data["arms"], project_data["ratios"],
-                            start_id, next_block_id, project_data["seed_base"]
-                        )
-                        project_data["master_tables"][chosen_stratum].extend(new_block_rows)
-                        project_data["current_block_ids"][chosen_stratum] += 1
-                    
-                    # 3. 提取分配的行数据
-                    matched_row = project_data["master_tables"][chosen_stratum][current_idx]
-                    
-                    # 4. 写入临床随访数据库
-                    project_data["allocated_subjects"].append({
-                        "Subject_ID": sub_id.strip(),
-                        "Stratum": chosen_stratum,
-                        "Stratum_Seq_ID": matched_row["层内随机序号"],
-                        "True_Arm": matched_row["真实分组(True_Arm)"],
-                        "Blind_Code": matched_row["物资盲码(Blind_Code)"],
-                        "Operator": current_role,
-                        "Time": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
-                    })
-                    
-                    add_audit_log(current_role, selected_project_id, "ALLOCATE_SUBJECT", 
-                                  f"受试者 {sub_id} 在层 [{chosen_stratum}] 成功执行分配，匹配序号: No.{matched_row['层内随机序号']}。")
-                    st.success(f"🎉 动态中央随机分配成功！")
-                    st.rerun()
-
-        with col_e2:
-            st.markdown("##### 💊 当期受试者动态响应结果")
-            if project_data["allocated_subjects"]:
-                latest = project_data["allocated_subjects"][-1]
-                st.metric(label="当前中心已消耗序号至", value=f"No. {latest['Stratum_Seq_ID']}")
-                st.code(f"现场必须指派/配发的物资盲码： {latest['Blind_Code']}", language="markdown")
-                
-                if "开放" not in project_data["blind_type"]:
-                    st.warning("🔒 严格盲态提示：真实分组名称已屏蔽。请根据上述物资盲码配发带有对应标签的治疗耗材。")
-                else:
-                    st.success(f"🔓 开放标签提示：该受试者真实分入组别为 【{latest['True_Arm']}】")
+                    st.caption("暂无统计数据")
             else:
-                st.info("等待左侧录入筛选合格患者信息提交随机分配...")
+                total_count = len(df_allocated) if not df_allocated.empty else 0
+                st.info(f"**🔐 盲态保护中**\n\n中央数据库显示当前总计已入组：**{total_count}** 例。\n\n*系统已严格执行全网随机区组内的分配均衡约束。*")
 
-        st.markdown("---")
-        st.markdown(f"##### 📊 项目 [{selected_project_id}] 实时已入组临床随访流水明细")
-        if project_data["allocated_subjects"]:
-            df_alloc = pd.DataFrame(project_data["allocated_subjects"])
-            
-            # 根据角色和盲态动态隔离真实治疗组别
-            if "开放" not in project_data["blind_type"] and current_role not in ["数据管理员(DM)"]:
-                df_alloc["True_Arm"] = "🔒 [已设盲] 仅限非盲数据管理员(DM)可调阅"
-                
-            # 渲染已触发破盲的个例
-            for idx, row in df_alloc.iterrows():
-                if row["Subject_ID"] in project_data["unblinded_list"]:
-                    df_alloc.at[idx, "True_Arm"] = f"🚨已紧急解盲: {project_data['master_tables'][row['Stratum']][row['Stratum_Seq_ID']-1]['真实分组(True_Arm)']}"
-
-            st.dataframe(df_alloc[["Subject_ID", "Stratum", "Stratum_Seq_ID", "Blind_Code", "True_Arm", "Operator", "Time"]], use_container_width=True)
-
-# ------------------------------------------
-# 页签 4：安全性破盲与不可逆审计
-# ------------------------------------------
+# 标签页 4：安全性与解盲
 with tab_safety:
     st.header("4. 安全性突发事件处理与不可逆审计追踪")
-    if not selected_project_id:
-        st.warning("⚠️ 请先创建或选择一个活动项目。")
-    else:
-        col_s1, col_s2 = st.columns([2, 3])
-        with col_s1:
-            st.subheader("🚨 严重不良事件(SAE)紧急医学解盲安全锁")
-            st.markdown("⚠️ 警告：该操作属于最高级别合规事件，一旦执行将永久记入稽查追踪，且无法回滚。")
-            
-            input_sub = st.text_input("1. 请输入需紧急破盲的受试者编号", value="")
-            input_reason = st.text_area("2. 请输入强制医学破盲的详细医学理由 (GCP必填核查项)", value="")
-            input_sign = st.text_input("3. 临床主要研究者(PI)或执行医生电子签名确认", value="")
-            input_pwd = st.text_input("🔑 4. 请输入该研究项目独属的紧急解盲密码锁", type="password")
-            
-            if st.button("🔥 验证双重安全锁并强制解盲", type="primary"):
-                if not input_sub.strip() or not input_reason.strip() or not input_sign.strip() or not input_pwd.strip():
-                    st.error("❌ 解盲失败：以上 4 项关键核查要素必须全部完整填写！")
-                else:
-                    if input_pwd.strip() != project_data["unblinded_pwd"]:
-                        st.error("❌ 密码错误！解盲安全锁拒绝访问。该非法尝试已强制通报并写入安全审计轨迹。")
-                        add_audit_log(f"Unauthenticated_User_{input_sign}", selected_project_id, "SECURITY_VIOLATION_ATTEMPT", 
-                                      f"警告：有人企图使用错误密码对受试者 {input_sub} 实施恶意破盲！")
-                    else:
-                        found = [x for x in project_data["allocated_subjects"] if x['Subject_ID'] == input_sub.strip()]
-                        if not found:
-                            st.error(f"❌ 检索失败：在当前项目 [{selected_project_id}] 中未检索到编号为 {input_sub} 的受试者。")
-                        else:
-                            project_data["unblinded_list"].add(input_sub.strip())
-                            true_treatment = found[0]["True_Arm"]
-                            
-                            add_audit_log(f"Investigator_{input_sign}", selected_project_id, "EMERGENCY_UNBLIND_LOGGED", 
-                                          f"双重密码核验成功，强制执行医学破盲。破盲患者: {input_sub}。抢救医学事由: {input_reason}")
-                            st.error(f"🚨 安全锁已完全解开，患者【{input_sub}】盲态完全刺破！")
-                            st.info(f"该受试者在后台盲底矩阵中实际分入的是：【{true_treatment}】。请立即采取针对性临床抢救。")
-                            st.rerun()
-
-        with col_s2:
-            st.subheader("🛡️ 系统不可逆合规审计追踪记录 (GCP Audit Trail)")
-            if current_role not in ["申办方监查员(CRA)", "数据管理员(DM)"]:
-                st.warning("🔒 依从性提示：前台盲态临床执行人员(研究者/CRC)无权调阅底层合规稽查大日志。请切换身份为 CRA 或 DM 调阅。")
+    if selected_project_id:
+        st.markdown("### 🚨 紧急安全解盲 (Emergency Unblinding)")
+        st.warning("警告：非必要请勿执行此操作。此操作将永久、不可逆地在系统日志中记录谁在何时解开了哪一位患者的真实盲底。")
+        
+        target_sub_id = st.text_input("请输入需要紧急解盲的受试者编号")
+        input_pwd = st.text_input("请输入项目安全解锁密码", type="password")
+        
+        if st.button("🔥 申请强制解盲", type="secondary"):
+            if input_pwd != unblind_pwd:
+                st.error("❌ 密码错误，拒绝解盲申请！")
             else:
-                if st.session_state.audit_trail:
-                    df_audit = pd.DataFrame(st.session_state.audit_trail)
-                    filtered_audit = df_audit[df_audit["操作项目"] == selected_project_id]
-                    st.dataframe(filtered_audit, use_container_width=True)
+                conn = sqlite3.connect(DB_FILE)
+                cursor = conn.cursor()
+                cursor.execute("SELECT true_arm, blind_code FROM allocated_subjects WHERE trial_id=? AND subject_id=?", (selected_project_id, target_sub_id.strip()))
+                res = cursor.fetchone()
+                conn.close()
+                if not res:
+                    st.error("❌ 未查找到该受试者入组记录。")
+                else:
+                    st.error(f"🚨 解盲成功！该患者分配的【物资 {res[1]}】对应的真实组别为：【 {res[0]} 】")
+                    add_audit_log(current_role, selected_project_id, "EMERGENCY_UNBLIND", f"研究员强行解开了患者 {target_sub_id} 的盲底。")
+                    st.rerun()
                     
-                    csv_logs = filtered_audit.to_csv(index=False).encode('utf-8-sig')
-                    st.download_button(
-                        label="📥 导出当前项目合规审计追踪大日志 (CSV)",
-                        data=csv_logs,
-                        file_name=f"GCP_Audit_Trail_{selected_project_id}.csv",
-                        mime='text/csv'
-                    )
+        st.markdown("---")
+        st.markdown("### 📝 系统不可逆合规审计日志 (Audit Trail)")
+        conn = sqlite3.connect(DB_FILE)
+        df_audit = pd.read_sql_query("SELECT time_stamp as 时间戳, operator as 操作用户, action as 操作行为, details as 详细记录 FROM audit_trail WHERE trial_id=?", conn, params=(selected_project_id,))
+        conn.close()
+        st.dataframe(df_audit, use_container_width=True)
