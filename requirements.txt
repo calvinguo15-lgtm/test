@@ -1,0 +1,5 @@
+Plaintext
+streamlit
+pandas
+st-theme
+psycopg2-binary
