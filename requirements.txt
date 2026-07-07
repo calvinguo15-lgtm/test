@@ -1,5 +1,4 @@
-Plaintext
 streamlit
 pandas
-st-theme
-psycopg2-binary
+sqlalchemy
+psycopg2-binary==2.9.9
