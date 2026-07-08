@@ -3,6 +3,7 @@ import pandas as pd
 import hashlib
 import time
 import random
+import json
 # 核心修复：引入 SQLAlchemy 的 text 函数以适配云端多数据库环境
 from sqlalchemy import text
 
@@ -109,31 +110,35 @@ def get_all_projects():
 
 def get_allocated_count(trial_id, stratum):
     query = text("SELECT COUNT(*) FROM allocated_subjects WHERE trial_id = :t AND stratum = :s;")
-    df = conn.query(query, params={"t": trial_id, "s": stratum}, ttl=0)
+    with conn.session as session:
+        df = pd.DataFrame(session.execute(query, {"t": trial_id, "s": stratum}).fetchall())
     return int(df.iloc[0, 0]) if not df.empty else 0
 
 def get_next_blind_info(trial_id, stratum, seq_id):
     """从盲底表读取当前序号对应的盲底信息，如果不存在则动态扩充区块"""
     query = text("SELECT true_arm, blind_code, block_id, block_size FROM master_tables WHERE trial_id = :t AND stratum = :s AND seq_id = :seq;")
-    df = conn.query(query, params={"t": trial_id, "s": stratum, "seq": seq_id}, ttl=0)
+    with conn.session as session:
+        res = session.execute(query, {"t": trial_id, "s": stratum, "seq": seq_id}).fetchone()
     
-    if not df.empty:
-        return df.iloc[0].to_dict()
+    if res is not None:
+        return {"true_arm": res[0], "blind_code": res[1], "block_id": res[2], "block_size": res[3]}
     
     # 盲底不足，触发动态扩充
     p_query = text("SELECT * FROM projects WHERE trial_id = :t;")
-    p_df = conn.query(p_query, params={"t": trial_id}, ttl=0)
-    if p_df.empty:
+    with conn.session as session:
+        p_res = session.execute(p_query, {"t": trial_id}).fetchone()
+    
+    if p_res is None:
         return None
     
-    proj = p_df.iloc[0]
-    arm_list = [x.strip() for x in proj['arms'].split(',')]
-    ratio_list = [int(x.strip()) for x in proj['ratios'].split(',')]
+    # 映射主表列名字段位置（0:trial_id, 1:trial_name, 2:pi, 3:unblind_pwd, 4:strata_list, 5:arms, 6:ratios, 7:seed_base, 8:current_block_ids）
+    arm_list = [x.strip() for x in p_res[5].split(',')]
+    ratio_list = [int(x.strip()) for x in p_res[6].split(',')]
+    seed_base = p_res[7]
+    current_block_ids_str = p_res[8]
     
-    # 解析当前区块状态并计算下一个 block_id
-    import json
     try:
-        block_status = json.loads(proj['current_block_ids'])
+        block_status = json.loads(current_block_ids_str)
     except:
         block_status = {}
         
@@ -145,7 +150,7 @@ def get_next_blind_info(trial_id, stratum, seq_id):
     block_size = total_ratio * 4 if total_ratio * 4 <= 12 else total_ratio * 2
     
     # 生成新区块
-    new_arms = generate_block(trial_id, stratum, next_block_id, block_size, arm_list, ratio_list, proj['seed_base'])
+    new_arms = generate_block(trial_id, stratum, next_block_id, block_size, arm_list, ratio_list, seed_base)
     
     # 写入新生成的区块到中央盲底库
     start_seq = (next_block_id - 1) * block_size + 1
@@ -203,13 +208,13 @@ with tabs[0]:
                 sub_id = st.text_input("受试者筛选号/随机号 (Subject ID, 确保项目内唯一):").strip()
                 selected_stratum = st.selectbox("分层因素组合 (Stratum):", strata_options)
                 operator = st.text_input("随访研究医生签名 (Operator):").strip()
-                submit_alloc = st.form_submit_form_button("申请中央分组与获取盲码")
+                submit_alloc = st.form_submit_button("申请中央分组与获取盲码")
                 
                 if submit_alloc:
                     if not sub_id or not operator:
                         st.error("❌ 错误：受试者筛选号以及操作医生签名均不能为空！")
                     else:
-       # 检查受试者 ID 是否重复（严格缩进版）
+                        # 检查受试者 ID 是否重复（安全无缓存会话执行）
                         with conn.session as session:
                             dup_check = session.execute(
                                 text("SELECT 1 FROM allocated_subjects WHERE trial_id = :t AND subject_id = :s;"), 
@@ -256,7 +261,7 @@ with tabs[0]:
             st.subheader("📈 本项目入组动态看板")
             
             # 读取已分配的受试者列表
-            df_alloc = conn.query(text("SELECT subject_id, stratum, stratum_seq_id, blind_code, operator, time_stamp FROM allocated_subjects WHERE trial_id = :t ORDER BY time_stamp DESC;"), 
+            df_alloc = conn.query("SELECT subject_id, stratum, stratum_seq_id, blind_code, operator, time_stamp FROM allocated_subjects WHERE trial_id = :t ORDER BY time_stamp DESC;", 
                                   params={"t": active_trial_id}, ttl=0)
             
             if df_alloc.empty:
@@ -303,19 +308,18 @@ with tabs[1]:
         if submit_proj:
             if not new_id or not new_name or not new_pwd:
                 st.error("❌ 错误：项目 ID、项目名称以及紧急破盲密码属于核心字段，均不能为空！")
-           else:
-                    # 重复性校验（改用底层的 session 执行，严格缩进 20 个空格）
-                    with conn.session as session:
-                        check_exist = session.execute(
-                            text("SELECT 1 FROM projects WHERE trial_id = :t;"), 
-                            {"t": new_id}
-                        ).fetchone()
+            else:
+                # 重复性校验（改用底层的 session 执行，绕开 conn.query 缓存报错）
+                with conn.session as session:
+                    check_exist = session.execute(
+                        text("SELECT 1 FROM projects WHERE trial_id = :t;"), 
+                        {"t": new_id}
+                    ).fetchone()
 
-                    if check_exist is not None:
+                if check_exist is not None:
                     st.error(f"❌ 冲突：系统内已存在编号为 '{new_id}' 的临床项目，请勿重复创建。")
                 else:
                     # 初始化保存
-                    import json
                     time_now = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
                     
                     with conn.session as session:
@@ -352,7 +356,7 @@ with tabs[2]:
         
         st.markdown("---")
         st.subheader("🔴 严重不良事件 (SAE) 紧急单中心一键破盲")
-        st.warning("⚠️ 安全警告：紧急揭盲操作将永久记录在系统无法篡改的审计追踪表中，仅在受试者发生严重医学突发状况，必须获知其所用核心药物品种以实施抢救时方可启用。")
+        st.warning("⚠️ 安全警告：紧急揭盲操作将永久记录在系统无法篡改的审计追踪表中，仅在受试者发生严重医学突发状况，必须获知其所用核心药物品种以实施抢急时方可启用。")
         
         target_sub_id = st.text_input("请输入需要破盲的受试者筛选号/随机号 (Subject ID):").strip()
         entered_pwd = st.text_input("请输入该项目专属的『紧急破盲密码』:", type="password")
@@ -374,17 +378,17 @@ with tabs[2]:
             else:
                 # 密码验证通过，调阅真实分组
                 res_query = text("SELECT true_arm, blind_code, stratum, stratum_seq_id FROM allocated_subjects WHERE trial_id = :t AND subject_id = :s;")
-                df_res = conn.query(res_query, params={"t": active_trial_id2, "s": target_sub_id}, ttl=0)
+                with conn.session as session:
+                    subject_info = session.execute(res_query, {"t": active_trial_id2, "s": target_sub_id}).fetchone()
                 
-                if df_res.empty:
+                if subject_info is None:
                     st.error(f"❌ 未找到受试者号 '{target_sub_id}' 在项目中的入组记录，无法破盲。")
                 else:
-                    subject_info = df_res.iloc[0]
                     time_now = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
                     
                     # 写入紧急解盲审计表
                     with conn.session as session:
-                        log_det = f"EMERGENCY UNBLIND COMPLETED for Subject {target_sub_id}. Stratum: {subject_info['stratum']}, Seq: {subject_info['stratum_seq_id']}. Exposed Arm: {subject_info['true_arm']}, Blind Code: {subject_info['blind_code']}."
+                        log_det = f"EMERGENCY UNBLIND COMPLETED for Subject {target_sub_id}. Stratum: {subject_info[2]}, Seq: {subject_info[3]}. Exposed Arm: {subject_info[0]}, Blind Code: {subject_info[1]}."
                         session.execute(text("""
                             INSERT INTO audit_trail (time_stamp, trial_id, operator, action, details)
                             VALUES (:tm, :t, :op, 'EMERGENCY_UNBLIND', :det);
@@ -393,8 +397,8 @@ with tabs[2]:
                     
                     st.error("🚨 紧急揭盲成功 —— 组别解密结果如下：")
                     st.write(f"**受试者筛选号**: `{target_sub_id}`")
-                    st.write(f"**获配盲码**: `{subject_info['blind_code']}`")
-                    st.markdown(f"### **底层真实分配组别 (True Treatment Group): :red[{subject_info['true_arm']}]**")
+                    st.write(f"**获配盲码**: `{subject_info[1]}`")
+                    st.markdown(f"### **底层真实分配组别 (True Treatment Group): :red[{subject_info[0]}]**")
                     st.info("此项揭盲记录已同步永久固化归档至国家级临床规范级别的中央审计追踪日志中。")
                     
         st.markdown("---")
@@ -404,7 +408,7 @@ with tabs[2]:
         export_pwd = st.text_input("请输入紧急破盲密码以核验导出权限:", type="password", key="export_pwd")
         if st.button("📥 生成脱敏入组交叉数据表"):
             if export_pwd == proj_data2['unblind_pwd']:
-                export_df = conn.query(text("SELECT subject_id, stratum, stratum_seq_id, blind_code, operator, time_stamp FROM allocated_subjects WHERE trial_id = :t ORDER BY stratum, stratum_seq_id;"), 
+                export_df = conn.query("SELECT subject_id, stratum, stratum_seq_id, blind_code, operator, time_stamp FROM allocated_subjects WHERE trial_id = :t ORDER BY stratum, stratum_seq_id;", 
                                        params={"t": active_trial_id2}, ttl=0)
                 if export_df.empty:
                     st.warning("当前项目尚未录入任何受试者数据。")
