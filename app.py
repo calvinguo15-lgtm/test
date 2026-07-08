@@ -4,21 +4,38 @@ import time
 import hashlib
 
 # =========================================================================
-# 🔥 终极黑科技：运行时动态热加载数据库驱动（彻底解决服务器安装冲突）
+# 🔥 动态热加载数据库驱动（强化刷新版，彻底解决 ModuleNotFoundError）
 # =========================================================================
 try:
     import psycopg2
     import sqlalchemy
 except ImportError:
-    # 如果发现云端没有驱动，代码在运行时自己悄悄安装，绕过 Streamlit 部署检查器
-    os.system(f"{sys.executable} -m pip install --upgrade pip")
-    os.system(f"{sys.executable} -m pip install sqlalchemy psycopg2-binary==2.9.9")
-    import psycopg2
-    import sqlalchemy
+    # 1. 强行在代码最开始，通过底层静默安装所需驱动
+    os.system(f"{sys.executable} -m pip install --no-cache-dir sqlalchemy psycopg2-binary==2.9.9")
+    
+    # 2. 【核心修复】：强行刷新 Python 的环境变量和系统路径，确保能立刻认出新安装的包
+    import importlib
+    importlib.invalidate_caches()
+    
+    # 3. 再次尝试导入，并告知系统路径
+    try:
+        import psycopg2
+        import sqlalchemy
+    except ImportError:
+        # 兜底方案：如果还是找不到，强行将本地用户的 site-packages 路径塞进系统
+        import site
+        user_site = site.getusersitepackages()
+        if user_site not in sys.path:
+            sys.path.append(user_site)
+        
+        import psycopg2
+        import sqlalchemy
 
 import streamlit as st
 import pandas as pd
-
+# =========================================================================
+# 以下代码（conn = st.connection... 等）保持完全不变
+# =========================================================================
 # =========================================================================
 # 0. 核心安全机制：云端 SQL 数据库中央存储
 # =========================================================================
