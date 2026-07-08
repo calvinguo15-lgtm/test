@@ -303,12 +303,15 @@ with tabs[1]:
         if submit_proj:
             if not new_id or not new_name or not new_pwd:
                 st.error("❌ 错误：项目 ID、项目名称以及紧急破盲密码属于核心字段，均不能为空！")
-            else:
-                # 重复性校验（改用底层的 session 执行，绕开 conn.query 缓存报错）
-with conn.session as session:
-    check_exist = session.execute(text("SELECT 1 FROM projects WHERE trial_id = :t;"), {"t": new_id}).fetchone()
+           else:
+                    # 重复性校验（改用底层的 session 执行，严格缩进 20 个空格）
+                    with conn.session as session:
+                        check_exist = session.execute(
+                            text("SELECT 1 FROM projects WHERE trial_id = :t;"), 
+                            {"t": new_id}
+                        ).fetchone()
 
-if check_exist is not None:
+                    if check_exist is not None:
                     st.error(f"❌ 冲突：系统内已存在编号为 '{new_id}' 的临床项目，请勿重复创建。")
                 else:
                     # 初始化保存
