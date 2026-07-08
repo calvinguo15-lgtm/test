@@ -210,9 +210,11 @@ with tabs[0]:
                         st.error("❌ 错误：受试者筛选号以及操作医生签名均不能为空！")
                     else:
                         # 检查受试者 ID 是否重复
-                        dup_check = conn.query(text("SELECT 1 FROM allocated_subjects WHERE trial_id = :t AND subject_id = :s;"), 
-                                               params={"t": active_trial_id, "s": sub_id}, ttl=0)
-                        if not dup_check.empty:
+                        with conn.session as session:
+    dup_check = session.execute(text("SELECT 1 FROM allocated_subjects WHERE trial_id = :t AND subject_id = :s;"), 
+                                {"t": active_trial_id, "s": sub_id}).fetchone()
+
+if dup_check is not None:
                             st.error(f"❌ 错误：受试者号 '{sub_id}' 在本项目中已被分配，请勿重复提交。")
                         else:
                             # 计算本分层因子的下一个序号
@@ -300,9 +302,11 @@ with tabs[1]:
             if not new_id or not new_name or not new_pwd:
                 st.error("❌ 错误：项目 ID、项目名称以及紧急破盲密码属于核心字段，均不能为空！")
             else:
-                # 重复性校验
-                check_exist = conn.query(text("SELECT 1 FROM projects WHERE trial_id = :t;"), params={"t": new_id}, ttl=0)
-                if not check_exist.empty:
+                # 重复性校验（改用底层的 session 执行，绕开 conn.query 缓存报错）
+with conn.session as session:
+    check_exist = session.execute(text("SELECT 1 FROM projects WHERE trial_id = :t;"), {"t": new_id}).fetchone()
+
+if check_exist is not None:
                     st.error(f"❌ 冲突：系统内已存在编号为 '{new_id}' 的临床项目，请勿重复创建。")
                 else:
                     # 初始化保存
