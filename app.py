@@ -209,12 +209,14 @@ with tabs[0]:
                     if not sub_id or not operator:
                         st.error("❌ 错误：受试者筛选号以及操作医生签名均不能为空！")
                     else:
-                        # 检查受试者 ID 是否重复
+       # 检查受试者 ID 是否重复（严格缩进版）
                         with conn.session as session:
-    dup_check = session.execute(text("SELECT 1 FROM allocated_subjects WHERE trial_id = :t AND subject_id = :s;"), 
-                                {"t": active_trial_id, "s": sub_id}).fetchone()
+                            dup_check = session.execute(
+                                text("SELECT 1 FROM allocated_subjects WHERE trial_id = :t AND subject_id = :s;"), 
+                                {"t": active_trial_id, "s": sub_id}
+                            ).fetchone()
 
-if dup_check is not None:
+                        if dup_check is not None:
                             st.error(f"❌ 错误：受试者号 '{sub_id}' 在本项目中已被分配，请勿重复提交。")
                         else:
                             # 计算本分层因子的下一个序号
